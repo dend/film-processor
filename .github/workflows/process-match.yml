@@ -23,8 +23,23 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
+      # OIDC FIRST so the failure callback always has a token. If checkout/
+      # build fail before this step (the original ordering), the if:failure()
+      # step gets an empty OIDC_TOKEN and can't authenticate the /fail POST.
+      # The result PUT authenticates with this GitHub OIDC ID token (issuer
+      # token.actions.githubusercontent.com), NOT a secret carried in
+      # client_payload — payload is visible in the repo's event UI. The
+      # Worker verifies issuer + repository + ref claims.
       # SHA-pinned (S1): this is the only job with id-token:write, so a
       # tag-move on any of these actions could mint a passing OIDC token.
+      - name: Mint OIDC token
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        id: oidc
+        with:
+          script: |
+            const tok = await core.getIDToken('filmshell-process');
+            core.setSecret(tok);
+            core.setOutput('token', tok);
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           persist-credentials: false
@@ -41,26 +56,12 @@ jobs:
           node-version: '20'
           cache: npm
           cache-dependency-path: filmshell/package-lock.json
-
       # --ignore-scripts (S12): process-one.mjs only needs dist/lib/*.js,
       # which is pure tsc output — no dep with a postinstall is on that path.
+      # N9: --ignore-scripts doesn't cover .bin/tsc executed by `npm run build`;
+      # branch-protection on main (required by docs/web-deploy.md §B) is the
+      # gate that prevents a lockfile change shadowing the typescript bin.
       - run: cd filmshell && npm ci --ignore-scripts && npm run build
-
-      # The result PUT authenticates with a GitHub OIDC ID token (issuer
-      # token.actions.githubusercontent.com), NOT a secret carried in
-      # client_payload — payload is visible in the repo's event UI. The
-      # Worker verifies issuer + repository + ref claims and matches the run
-      # against the D1 processing_queue row (15-min expiry) so a runner can
-      # only write the match it was dispatched for.
-      - name: Mint OIDC token
-        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
-        id: oidc
-        with:
-          script: |
-            const tok = await core.getIDToken('filmshell-process');
-            core.setSecret(tok);
-            core.setOutput('token', tok);
-
       - run: node process-one.mjs
         env:
           MATCH_ID: ${{ github.event.client_payload.matchId }}
@@ -73,14 +74,28 @@ jobs:
           OIDC_TOKEN: ${{ steps.oidc.outputs.token }}
           # R5: PROCESS_NONCE is NOT in client_payload (public-repo event UI
           # exposes payloads). The runner fetches it OIDC-gated.
-
       # Explicit failure callback — without it the queue row stays
       # queued/running until the RESULT_WINDOW_SEC age check makes it
-      # re-dispatchable. OIDC-gated like /result. Reuses process-one.mjs's
-      # origin validation rather than curling client_payload directly.
+      # re-dispatchable. Self-contained shell so it works even when checkout
+      # or build failed and process-one.mjs isn't on disk. The origin
+      # allowlist check is load-bearing: API_ORIGIN comes from client_payload,
+      # so without it a forged dispatch could exfil the OIDC bearer.
       - name: Report failure
         if: failure()
-        run: node process-one.mjs --report-fail
+        shell: bash
+        run: |
+          set -u
+          case ",${ALLOWED_API_ORIGINS}," in
+            *,"${API_ORIGIN}",*) ;;
+            *) echo "API_ORIGIN '${API_ORIGIN}' not in ALLOWED_API_ORIGINS; not posting."; exit 0 ;;
+          esac
+          [[ "$MATCH_ID" =~ ^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$ ]] || { echo "bad MATCH_ID"; exit 0; }
+          NONCE="$(curl -fsS -H "authorization: Bearer ${OIDC_TOKEN}" \
+            "${API_ORIGIN}/api/process/${MATCH_ID}/nonce" | jq -r .nonce 2>/dev/null || true)"
+          curl -fsS -X POST -H "authorization: Bearer ${OIDC_TOKEN}" \
+            -H "x-process-nonce: ${NONCE}" \
+            "${API_ORIGIN}/api/process/${MATCH_ID}/fail" \
+            && echo "reported" || echo "fail-report POST failed (queue row will age out)"
         env:
           MATCH_ID: ${{ github.event.client_payload.matchId }}
           API_ORIGIN: ${{ github.event.client_payload.apiOrigin }}

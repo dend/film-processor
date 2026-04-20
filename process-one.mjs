@@ -5,11 +5,9 @@
 // issuer/aud/repository). No secrets in the dispatch payload.
 
 import { gunzipSync } from 'node:zlib';
-import {
-  extractRoster, extractAllPlayerPositions, scalePathsToWorld,
-  computeMotionStats, extractDeathPositions, filterImportantObjects,
-  toMetaJson, toPathsJson,
-} from './filmshell/dist/lib/index.js';
+// The library import is DEFERRED (dynamic import below) so the --report-fail
+// path works even when checkout/build failed and dist/ doesn't exist — that's
+// exactly when the failure callback is most needed.
 
 // client_payload comes from repository_dispatch — only our Worker fires it,
 // but the workflow lives in a public repo and the values are attacker-
@@ -42,17 +40,11 @@ const j = (url) => fetch(url, { headers: auth }).then(r => r.ok ? r.json()
 const { nonce: PROCESS_NONCE } = await j(`${API}/api/process/${MATCH_ID}/nonce`);
 if (!PROCESS_NONCE) { console.error('nonce fetch failed'); process.exit(2); }
 
-// --report-fail: the workflow's `if: failure()` step. Same origin validation,
-// then a single OIDC-gated POST so the queue row flips to 'failed' instead of
-// waiting out RESULT_WINDOW_SEC.
-if (process.argv.includes('--report-fail')) {
-  const r = await fetch(`${API}/api/process/${MATCH_ID}/fail`, {
-    method: 'POST',
-    headers: { ...auth, 'x-process-nonce': PROCESS_NONCE },
-  }).catch(e => ({ ok: false, status: e.message }));
-  console.log(`reported failure → ${r.status}`);
-  process.exit(0);
-}
+const {
+  extractRoster, extractAllPlayerPositions, scalePathsToWorld,
+  computeMotionStats, extractDeathPositions, filterImportantObjects,
+  toMetaJson, toPathsJson,
+} = await import('./filmshell/dist/lib/index.js');
 
 const manifest = await j(`${API}/api/match/${MATCH_ID}/manifest`);
 const mapData = await j(`${API}/api/map/${manifest.mapAssetId}/${manifest.mapVersionId}`);
