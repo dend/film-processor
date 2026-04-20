@@ -1,0 +1,88 @@
+name: process-match
+# display_title carries the matchId so the Worker can find this run by polling
+# /repos/{repo}/actions/runs and matching on it (repository_dispatch returns
+# 204 with no run id).
+run-name: process-match ${{ github.event.client_payload.matchId }}
+on:
+  repository_dispatch:
+    types: [process-match]
+
+# One match per job; matchId is the dedupe key. The Worker's processing_queue
+# has already deduped before dispatching, so concurrent same-match dispatches
+# can't happen — but the cancel-in-progress belt-and-suspenders it.
+concurrency:
+  group: process-${{ github.event.client_payload.matchId }}
+  cancel-in-progress: false
+
+permissions:
+  id-token: write   # mint an OIDC token the Worker can verify
+  contents: read
+
+jobs:
+  process:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      # SHA-pinned (S1): this is the only job with id-token:write, so a
+      # tag-move on any of these actions could mint a passing OIDC token.
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+
+      # filmshell library — the extraction pipeline runs here (dist/lib/).
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          repository: dend/filmshell
+          path: filmshell
+          persist-credentials: false
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: filmshell/package-lock.json
+
+      # --ignore-scripts (S12): process-one.mjs only needs dist/lib/*.js,
+      # which is pure tsc output — no dep with a postinstall is on that path.
+      - run: cd filmshell && npm ci --ignore-scripts && npm run build
+
+      # The result PUT authenticates with a GitHub OIDC ID token (issuer
+      # token.actions.githubusercontent.com), NOT a secret carried in
+      # client_payload — payload is visible in the repo's event UI. The
+      # Worker verifies issuer + repository + ref claims and matches the run
+      # against the D1 processing_queue row (15-min expiry) so a runner can
+      # only write the match it was dispatched for.
+      - name: Mint OIDC token
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        id: oidc
+        with:
+          script: |
+            const tok = await core.getIDToken('filmshell-process');
+            core.setSecret(tok);
+            core.setOutput('token', tok);
+
+      - run: node process-one.mjs
+        env:
+          MATCH_ID: ${{ github.event.client_payload.matchId }}
+          API_ORIGIN: ${{ github.event.client_payload.apiOrigin }}
+          # MUST be set as a repo variable (Settings → Variables → Actions).
+          # No fallback to client_payload — that would let an attacker write
+          # both sides of the allowlist check. process-one.mjs exits non-zero
+          # if this is empty, so the workflow visibly fails until configured.
+          ALLOWED_API_ORIGINS: ${{ vars.ALLOWED_API_ORIGINS }}
+          OIDC_TOKEN: ${{ steps.oidc.outputs.token }}
+          # R5: PROCESS_NONCE is NOT in client_payload (public-repo event UI
+          # exposes payloads). The runner fetches it OIDC-gated.
+
+      # Explicit failure callback — without it the queue row stays
+      # queued/running until the RESULT_WINDOW_SEC age check makes it
+      # re-dispatchable. OIDC-gated like /result. Reuses process-one.mjs's
+      # origin validation rather than curling client_payload directly.
+      - name: Report failure
+        if: failure()
+        run: node process-one.mjs --report-fail
+        env:
+          MATCH_ID: ${{ github.event.client_payload.matchId }}
+          API_ORIGIN: ${{ github.event.client_payload.apiOrigin }}
+          ALLOWED_API_ORIGINS: ${{ vars.ALLOWED_API_ORIGINS }}
+          OIDC_TOKEN: ${{ steps.oidc.outputs.token }}
