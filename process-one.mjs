@@ -4,7 +4,7 @@
 // PUTs the result back with a GitHub OIDC ID token (the Worker verifies
 // issuer/aud/repository). No secrets in the dispatch payload.
 
-import { gunzipSync } from 'node:zlib';
+import { inflateSync, gunzipSync } from 'node:zlib';
 // The library import is DEFERRED (dynamic import below) so the --report-fail
 // path works even when checkout/build failed and dist/ doesn't exist — that's
 // exactly when the failure callback is most needed.
@@ -49,13 +49,28 @@ const {
 const manifest = await j(`${API}/api/match/${MATCH_ID}/manifest`);
 const mapData = await j(`${API}/api/map/${manifest.mapAssetId}/${manifest.mapVersionId}`);
 
+// Halo film chunks are zlib-deflate (lib/node/download.ts:222 uses inflateSync,
+// not gunzip). Sniff the first bytes so a CDN/worker that transparently
+// re-encodes to gzip doesn't break us either.
+function decompress(buf) {
+  if (buf.length < 4) throw new Error(`chunk too short (${buf.length}B) — likely an error body`);
+  // gzip magic 1f 8b
+  if (buf[0] === 0x1f && buf[1] === 0x8b) return gunzipSync(buf);
+  // zlib header: 78 01/5e/9c/da (CMF=0x78, FLG checksum-valid)
+  if (buf[0] === 0x78) return inflateSync(buf);
+  // Already decompressed (or unknown) — let extraction try as-is.
+  return buf;
+}
+
 console.log(`fetching ${manifest.chunkUrls.length} chunks…`);
 const chunks = [];
 for (const url of manifest.chunkUrls) {
-  const r = await fetch(new URL(url, API));
-  if (!r.ok) throw new Error(`${url} → ${r.status}`);
-  const gz = new Uint8Array(await r.arrayBuffer());
-  chunks.push(new Uint8Array(gunzipSync(gz)));
+  // OIDC bearer so the worker's frontGate skips this runner (N7); chunk
+  // handler itself isn't gated but the manifest path that wrote chunkmap is.
+  const r = await fetch(new URL(url, API), { headers: auth });
+  if (!r.ok) throw new Error(`${url} → ${r.status} ${(await r.text().catch(() => '')).slice(0, 200)}`);
+  const raw = new Uint8Array(await r.arrayBuffer());
+  chunks.push(new Uint8Array(decompress(raw)));
 }
 
 const roster = extractRoster(chunks[0]);
