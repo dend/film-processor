@@ -1,8 +1,8 @@
 # The workflow for GITHUB_PROCESS_REPO (e.g. dend/film-processor). This public
-# repo holds only the workflow + a thin process-one.mjs; the private
-# dend/filmshell is checked out into ./filmshell/ for the extraction library.
-# Needs FILMSHELL_READ_TOKEN (a fine-grained PAT with Contents:Read on
-# dend/filmshell only).
+# repo holds ONLY this workflow file; everything else (process-one.mjs, the
+# library, package.json) lives in the private dend/filmshell which is checked
+# out into ./filmshell/. Needs FILMSHELL_READ_TOKEN (a fine-grained PAT with
+# Contents:Read on dend/filmshell only).
 #
 # repository_dispatch only fires workflows on the DEFAULT BRANCH of THIS repo.
 # Keep this file on main.
@@ -53,11 +53,6 @@ jobs:
             *) echo "API_ORIGIN '${API_ORIGIN}' not in ALLOWED_API_ORIGINS"; exit 1 ;;
           esac
 
-      # This repo (process-one.mjs at root)
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
-        with:
-          persist-credentials: false
-
       # Private library repo. The default GITHUB_TOKEN can't read another
       # private repo, so this needs a PAT with Contents:Read on dend/filmshell.
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
@@ -81,7 +76,9 @@ jobs:
       - run: npm run build
         working-directory: filmshell
 
-      - run: node process-one.mjs
+      # Run the script FROM the checked-out filmshell tree so this repo
+      # holds nothing but the workflow — one less file to keep in sync.
+      - run: node filmshell/tools/process-one.mjs
         env:
           MATCH_ID: ${{ github.event.client_payload.matchId }}
           API_ORIGIN: ${{ github.event.client_payload.apiOrigin }}
