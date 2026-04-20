@@ -1,21 +1,21 @@
+# The workflow for GITHUB_PROCESS_REPO (e.g. dend/film-processor). This public
+# repo holds only the workflow + a thin process-one.mjs; the private
+# dend/filmshell is checked out into ./filmshell/ for the extraction library.
+# Needs FILMSHELL_READ_TOKEN (a fine-grained PAT with Contents:Read on
+# dend/filmshell only).
+#
+# repository_dispatch only fires workflows on the DEFAULT BRANCH of THIS repo.
+# Keep this file on main.
+
 name: process-match
-# display_title carries the matchId so the Worker can find this run by polling
-# /repos/{repo}/actions/runs and matching on it (repository_dispatch returns
-# 204 with no run id).
 run-name: process-match ${{ github.event.client_payload.matchId }}
+
 on:
   repository_dispatch:
     types: [process-match]
 
-# One match per job; matchId is the dedupe key. The Worker's processing_queue
-# has already deduped before dispatching, so concurrent same-match dispatches
-# can't happen — but the cancel-in-progress belt-and-suspenders it.
-concurrency:
-  group: process-${{ github.event.client_payload.matchId }}
-  cancel-in-progress: false
-
 permissions:
-  id-token: write   # mint an OIDC token the Worker can verify
+  id-token: write
   contents: read
 
 jobs:
@@ -23,15 +23,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      # OIDC FIRST so the failure callback always has a token. If checkout/
-      # build fail before this step (the original ordering), the if:failure()
-      # step gets an empty OIDC_TOKEN and can't authenticate the /fail POST.
-      # The result PUT authenticates with this GitHub OIDC ID token (issuer
-      # token.actions.githubusercontent.com), NOT a secret carried in
-      # client_payload — payload is visible in the repo's event UI. The
-      # Worker verifies issuer + repository + ref claims.
-      # SHA-pinned (S1): this is the only job with id-token:write, so a
-      # tag-move on any of these actions could mint a passing OIDC token.
+      # OIDC FIRST so the if:failure() callback always has a token regardless
+      # of where the job dies. SHA-pinned (S1).
       - name: Mint OIDC token
         uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         id: oidc
@@ -40,15 +33,39 @@ jobs:
             const tok = await core.getIDToken('filmshell-process');
             core.setSecret(tok);
             core.setOutput('token', tok);
+
+      # API_ORIGIN comes from client_payload (attacker-supplied if a forged
+      # dispatch ever reached this workflow). The OIDC bearer is the only
+      # credential a forged origin could exfil — it's never passed to a step
+      # that makes a request until this allowlist check has passed.
+      # process-one.mjs ALSO validates this; the workflow-level gate is the
+      # auditable line and fail-fasts before npm ci/build burn ~80s.
+      - name: Validate API_ORIGIN
+        shell: bash
+        env:
+          API_ORIGIN: ${{ github.event.client_payload.apiOrigin }}
+          ALLOWED_API_ORIGINS: ${{ vars.ALLOWED_API_ORIGINS }}
+        run: |
+          set -u
+          [ -n "${ALLOWED_API_ORIGINS}" ] || { echo "ALLOWED_API_ORIGINS repo variable not set"; exit 1; }
+          case ",${ALLOWED_API_ORIGINS}," in
+            *,"${API_ORIGIN}",*) echo "ok: ${API_ORIGIN}" ;;
+            *) echo "API_ORIGIN '${API_ORIGIN}' not in ALLOWED_API_ORIGINS"; exit 1 ;;
+          esac
+
+      # This repo (process-one.mjs at root)
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           persist-credentials: false
 
-      # filmshell library — the extraction pipeline runs here (dist/lib/).
+      # Private library repo. The default GITHUB_TOKEN can't read another
+      # private repo, so this needs a PAT with Contents:Read on dend/filmshell.
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           repository: dend/filmshell
+          ref: den/public-gamertag-arch
           path: filmshell
+          token: ${{ secrets.FILMSHELL_READ_TOKEN }}
           persist-credentials: false
 
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
@@ -56,30 +73,25 @@ jobs:
           node-version: '20'
           cache: npm
           cache-dependency-path: filmshell/package-lock.json
-      # --ignore-scripts (S12): process-one.mjs only needs dist/lib/*.js,
-      # which is pure tsc output — no dep with a postinstall is on that path.
-      # N9: --ignore-scripts doesn't cover .bin/tsc executed by `npm run build`;
-      # branch-protection on main (required by docs/web-deploy.md §B) is the
-      # gate that prevents a lockfile change shadowing the typescript bin.
-      - run: cd filmshell && npm ci --ignore-scripts && npm run build
+
+      # --ignore-scripts (S12); branch-protection on main is the gate for
+      # .bin/tsc (N9).
+      - run: npm ci --ignore-scripts
+        working-directory: filmshell
+      - run: npm run build
+        working-directory: filmshell
+
       - run: node process-one.mjs
         env:
           MATCH_ID: ${{ github.event.client_payload.matchId }}
           API_ORIGIN: ${{ github.event.client_payload.apiOrigin }}
-          # MUST be set as a repo variable (Settings → Variables → Actions).
-          # No fallback to client_payload — that would let an attacker write
-          # both sides of the allowlist check. process-one.mjs exits non-zero
-          # if this is empty, so the workflow visibly fails until configured.
           ALLOWED_API_ORIGINS: ${{ vars.ALLOWED_API_ORIGINS }}
           OIDC_TOKEN: ${{ steps.oidc.outputs.token }}
-          # R5: PROCESS_NONCE is NOT in client_payload (public-repo event UI
-          # exposes payloads). The runner fetches it OIDC-gated.
-      # Explicit failure callback — without it the queue row stays
-      # queued/running until the RESULT_WINDOW_SEC age check makes it
-      # re-dispatchable. Self-contained shell so it works even when checkout
-      # or build failed and process-one.mjs isn't on disk. The origin
-      # allowlist check is load-bearing: API_ORIGIN comes from client_payload,
-      # so without it a forged dispatch could exfil the OIDC bearer.
+
+      # Self-contained inline shell so it works even when checkout/build failed
+      # and process-one.mjs/dist isn't on disk. The origin allowlist check is
+      # load-bearing: API_ORIGIN comes from client_payload, so without it a
+      # forged dispatch could exfil the OIDC bearer.
       - name: Report failure
         if: failure()
         shell: bash
