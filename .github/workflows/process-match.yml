@@ -58,7 +58,7 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           repository: dend/filmshell
-          ref: den/public-gamertag-arch
+          ref: main
           path: filmshell
           token: ${{ secrets.FILMSHELL_READ_TOKEN }}
           persist-credentials: false
